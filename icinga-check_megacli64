@@ -1,1 +1,2 @@
 icinga    ALL=(ALL) NOPASSWD: /usr/sbin/dmidecode,/opt/MegaRAID/MegaCli/MegaCli64
+Defaults:icinga !requiretty
