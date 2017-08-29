@@ -1,0 +1,159 @@
+#!/bin/bash
+# this file: /usr/lib64/nagios/plugins/check_megacli64
+# get megaraid basic raid health - Mel - 2017-08-28
+
+version="2017-08-28"
+megacli=/opt/MegaRAID/MegaCli/MegaCli64
+dmidecode=/usr/sbin/dmidecode
+dmitmp=/tmp/dmidecode.tmp.$$
+megainfo="-AdpAllInfo -aAll"
+virtdisk="-LDInfo -Lall -aALL"
+physdisk="-PDList -aALL"
+raidcardinfo=/tmp/rc.info.$$
+raidcardbbu=/tmp/rc.batt.$$
+raidcardvd=/tmp/rc.vdisk.$$
+raidcardpd=/tmp/rc.pdisk.$$
+raidcarderr=/tmp/rc.err.$$
+
+usage(){
+    cat << MEL
+Usage:
+$(basename $0) [OPTION] [OPTION] {...}
+
+Options:
+    -u - unconfigured drives return status OK
+         without this, unconfigured drives return WARNING
+    --unconfigured - same as -u
+    -w INTEGER - this option is silently ignored
+    --warning INTEGER same as -w
+    -c INTEGER - this option is silently ignored
+    --critical INTEGER - same as -c
+    -h - Show this message
+    --help - same as -h
+    -V - Show version info
+    --version - same as -V
+MEL
+}
+
+showver(){
+    echo "$(basename $0) version $version"
+}
+
+while getopts ":c:w:-:uhV" opt;do
+    case $opt in
+        c)  crit=$OPTARG ;;
+        w)  warn=$OPTARG ;;
+        h)  usage;exit ;;
+        V)  showver;exit ;;
+        u)  ignoreunconfigured="yes" ;;
+        -)
+            case $OPTARG in
+                help)         usage;exit ;;
+                version)      showver;exit ;;
+                warning)      warn=${!OPTIND};shift $OPTIND;OPTIND=1;;
+                warning=*)    warn=${OPTARG##*=};;
+                critical)     crit=${!OPTIND};shift $OPTIND;OPTIND=1;;
+                critical=*)   crit=${OPTARG##*=};;
+                unconfigured) ignoreunconfigured="yes" ;;
+                *)
+                    echo "Invalid long argument: --$OPTARG";usage;exit 1;;
+            esac
+            ;;
+        \?) echo "Invalid short argument: -$OPTARG";usage;exit 1 ;;
+        :)  echo "Argument -$OPTARG missing required value";usage;exit 1 ;;
+        *)  echo "Not sure how I got here: \"-$opt $OPTARG\"";usage;exit 1 ;;
+    esac
+done
+# speed optimization: bash ${sting#*: } is faster than calling |sed 's/^[^:]*: //'
+sudo $dmidecode >$dmitmp 2>&1
+manufacturer="$(grep -m1 Manufacturer: $dmitmp)"
+manufacturer="${manufacturer#*: }"
+product="$(grep -m1 'Product Name:' $dmitmp)"
+product="${product#*: }"
+serialno="$(grep -m1 'Serial Number:' $dmitmp)"
+serialno="${serialno#*: }"
+/bin/rm -f $dmitmp
+
+
+runmegacmd(){
+    sudo $megacli $1 >$2 2>$raidcarderr
+    if [[ $? -ne 0 ]];then
+        echo -e "Error occured while running: $megacli $1\nError was:\n$(cat $raidcarderr)"
+        exit
+    fi
+}
+
+# check disk status
+# is this a MegaRAID?
+if lspci|grep MegaRAID >/dev/null;then
+    # is megaraid admin software installed?
+    if [[ -x $megacli ]];then
+        runmegacmd "$megainfo" $raidcardinfo
+#        runmegacmd "$battery" $raidcardbbu
+        runmegacmd "$virtdisk" $raidcardvd
+        runmegacmd "$physdisk" $raidcardpd
+    else
+        echo "MegaRAID cli admin tool is not installed."
+        exit
+    fi
+    raidcard="$(grep -m1 '^Product Name' $raidcardinfo)"
+    raidcard="${raidcard#*: }"
+fi
+
+# default to ok. It will change if we find any problems.
+exitstatus=0
+exitstring="$manufacturer $product Serial:$serialno ($raidcard)"
+degraded="$(grep Degraded $raidcardinfo)"
+degraded="${degraded#*: }"
+degraded="${degraded# *}"
+if [[ $degraded != "" ]];then
+    if [[ $degraded -ne 0 ]];then
+        # warn if degraded, disk state pdisk check in next section may downgrade this if cause is failed
+        [[ $exitstatus -lt 1 ]] && exitstatus=1
+        [[ -z $exitstring ]] && exitstring="$degraded degraded vdisks" || exitstring="$exitstring, $degraded degraded vdisks"
+    fi
+else
+    [[ $exitstatus -lt 3 ]] && exitstatus=3
+    [[ -z $exitstring ]] && exitstring="Could not find disk degraded status" || exitstring="$exitstring, Could not find disk degraded status"
+fi
+for driveline in $(awk 'BEGIN{OFS=":"}/Slot Number/{slot=$NF;next}/Error/{err=err+$NF;next}/Firmware state/{gsub(/^[^:]*: */,"",$0);gsub(/ /,"",$0);print(slot,err,$0);err=0;next}' $raidcardpd);do
+    drivenum="${driveline%%:*}"
+    errors="${driveline%:*}"
+    errors="${errors#*:}"
+    diskstatus="${driveline##*:}"
+    unset thisdisk
+    if [[ $diskstatus =~ Failed ]];then
+        [[ -z $pdiskstring ]] && pdiskstring="Failed disk:$drivenum" || pdiskstring="$pdiskstring, Failed disk:$drivenum"
+        [[ $exitstatus -lt 2 ]] && exitstatus=2
+        thisdisk="resolved"
+    fi
+    if [[ $diskstatus =~ Rebuild ]];then
+        [[ -z $pdiskstring ]] && pdiskstring="Rebuilding disk:$drivenum" || pdiskstring="$pdiskstring, Rebuilding disk:$drivenum"
+        [[ $exitstatus -lt 1 ]] && exitstatus=1
+        thisdisk="resolved"
+    fi
+    if [[ $diskstatus =~ Unconfigured ]];then
+        [[ -z $unconfigured ]] && unconfigured="Unconfigured disks:$drivenum" || unconfigured="$unconfigured,$drivenum"
+        if [[ $ignoreunconfigured != "yes" ]];then
+            [[ $exitstatus -lt 1 ]] && exitstatus=1
+        fi
+        thisdisk="resolved"
+    fi
+    if [[ $diskstatus =~ SpunUp ]];then
+        thisdisk="resolved"
+    fi
+    if [[ -z $thisdisk ]];then
+        [[ -z $pdiskstring ]] && pdiskstring="Unknown state disk:$drivenum:$diskstatus" || pdiskstring="$pdiskstring, Unknown state disk:$drivenum:$diskstatus"
+    fi
+done
+[[ -z $pdiskstring ]] || exitstring="$exitstring, $pdiskstring"
+[[ -z $unconfigured ]] || exitstring="$exitstring, $unconfigured"
+
+exitstring="$exitstring$perfdata"
+case $exitstatus in
+    0)  echo "OK: $exitstring";;
+    1)  echo "WARNING: $exitstring";;
+    2)  echo "CRITICAL: $exitstring";;
+    *)  echo "UNKNOWN: $exitstring";;
+esac
+exit $exitstatus
