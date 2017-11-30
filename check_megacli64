@@ -1,8 +1,9 @@
 #!/bin/bash
 # this file: /usr/lib64/nagios/plugins/check_megacli64
 # get megaraid basic raid health - Mel - 2017-08-28
+# Mel - 2017-11-30 - unrunable megacli exits with proper icinga error
 
-version="2017-08-28"
+version="2017-11-30"
 megacli=/opt/MegaRAID/MegaCli/MegaCli64
 dmidecode=/usr/sbin/dmidecode
 dmitmp=/tmp/dmidecode.tmp.$$
@@ -77,9 +78,10 @@ serialno="${serialno#*: }"
 
 runmegacmd(){
     sudo $megacli $1 >$2 2>$raidcarderr
-    if [[ $? -ne 0 ]];then
-        echo -e "Error occured while running: $megacli $1\nError was:\n$(cat $raidcarderr)"
-        exit
+    thisraiderr=$?
+    if [[ $thisraiderr -ne 0 ]];then
+        echo -e "CRITICAL: Error occured while running: $megacli $1\nError ($thisraiderr) was:\n$(cat $raidcarderr)$(head -3 $2)"
+        exit 2
     fi
 }
 
@@ -148,6 +150,11 @@ for driveline in $(awk 'BEGIN{OFS=":"}/Slot Number/{slot=$NF;next}/Error/{err=er
 done
 [[ -z $pdiskstring ]] || exitstring="$exitstring, $pdiskstring"
 [[ -z $unconfigured ]] || exitstring="$exitstring, $unconfigured"
+
+# clean up after myself
+for oldtmpfile in $raidcardinfo $raidcardbbu $raidcardvd $raidcardpd;do
+    [[ -f $oldtmpfile ]] && /bin/rm -f $oldtmpfile
+done
 
 exitstring="$exitstring$perfdata"
 case $exitstatus in
