@@ -2,6 +2,7 @@
 # this file: /usr/lib64/nagios/plugins/check_megacli64
 # get megaraid basic raid health - Mel - 2017-08-28
 # Mel - 2017-11-30 - unrunable megacli exits with proper icinga error
+# Mel - 2018-09-25 - fix more than one raid array problem
 
 version="2017-11-30"
 megacli=/opt/MegaRAID/MegaCli/MegaCli64
@@ -105,9 +106,12 @@ fi
 # default to ok. It will change if we find any problems.
 exitstatus=0
 exitstring="$manufacturer $product Serial:$serialno ($raidcard)"
-degraded="$(grep Degraded $raidcardinfo)"
-degraded="${degraded#*: }"
-degraded="${degraded# *}"
+degradeinfo="$(grep Degraded $raidcardinfo)"
+degraded=0
+for oneraid in $degradeinfo;do
+    degraded="$(echo "$degraded+$oneraid"|bc)"
+done
+
 if [[ $degraded != "" ]];then
     if [[ $degraded -ne 0 ]];then
         # warn if degraded, disk state pdisk check in next section may downgrade this if cause is failed
